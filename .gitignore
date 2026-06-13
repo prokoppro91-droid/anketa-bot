@@ -1,5 +1,6 @@
 .env
 data.json
+deploy/
 __pycache__/
 *.pyc
 .venv/

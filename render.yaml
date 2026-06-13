@@ -1,0 +1,21 @@
+# Конфіг для безкоштовного хостингу на Render.com.
+# Render прочитає це автоматично. Секрети (токени) задаються в дашборді Render,
+# а не тут (тому sync: false).
+services:
+  - type: web
+    name: anketa-kosmetolog-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_IDS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FEEDBACK_DAYS
+        value: "10"
+      - key: REMIND_MINUTES
+        value: "60"

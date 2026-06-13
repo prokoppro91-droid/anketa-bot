@@ -584,6 +584,33 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваш chat_id: {update.effective_chat.id}\nВпишіть це число у ADMIN_CHAT_IDS.")
 
 
+def _maybe_start_health_server():
+    """У хмарі (Render) піднімає мінімальний HTTP-сервер на $PORT,
+    щоб сервіс вважався «живим» і UptimeRobot міг його пінгувати.
+    Локально (без PORT) нічого не робить."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"anketa-bot alive")
+
+        def log_message(self, *args):
+            pass
+
+    def _serve():
+        HTTPServer(("0.0.0.0", int(port)), _H).serve_forever()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    log.info("🌐 Health-сервер на порту %s (для Render/UptimeRobot)", port)
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ Не задано BOT_TOKEN. Див. README.md")
@@ -620,6 +647,7 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(feedback_checker, interval=3600, first=15)
 
+    _maybe_start_health_server()
     log.info("✅ Бот запущено. Адміни: %s. Очікую повідомлення…", ADMIN_IDS)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
