@@ -647,9 +647,29 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(feedback_checker, interval=3600, first=15)
 
-    _maybe_start_health_server()
-    log.info("✅ Бот запущено. Адміни: %s. Очікую повідомлення…", ADMIN_IDS)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    external = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL")
+    port = int(os.environ.get("PORT", "0") or 0)
+
+    if external and port:
+        # Хмарний режим (Render): webhook — вхідні апдейти будять сервіс,
+        # пінгер не потрібен, конфлікту з локальною копією немає.
+        import hashlib
+        secret = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:40]
+        log.info("✅ Бот запущено у WEBHOOK-режимі: %s. Адміни: %s", external, ADMIN_IDS)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="hook",
+            webhook_url=f"{external.rstrip('/')}/hook",
+            secret_token=secret,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        # Локальний режим: звичайний polling.
+        _maybe_start_health_server()
+        log.info("✅ Бот запущено (polling). Адміни: %s. Очікую повідомлення…", ADMIN_IDS)
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
