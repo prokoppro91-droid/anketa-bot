@@ -103,6 +103,11 @@ def _build_keyboard(q, selected=None):
         kb = [[KeyboardButton(CONTACT_BUTTON, request_contact=True)]]
         return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
 
+    if qtype == "photo":
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏭️ Пропустити (надішлю пізніше)", callback_data="photoskip")]]
+        )
+
     # text
     return ReplyKeyboardRemove()
 
@@ -212,6 +217,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Дякую 👍", reply_markup=ReplyKeyboardRemove())
         return await _advance(context, chat_id)
 
+    if qtype == "photo":
+        await update.message.reply_text(
+            "Надішліть, будь ласка, саме фото 📷 або натисніть «Пропустити» 👇"
+        )
+        return ASKING
+
     if qtype in ("choice", "multichoice") and q.get("allow_custom"):
         _record(context, text)
         return await _advance(context, chat_id)
@@ -219,6 +230,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # choice/multichoice без власного варіанту
     await update.message.reply_text("Будь ласка, скористайтеся кнопками вище 👆")
     return ASKING
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "idx" not in context.user_data:
+        return ASKING
+    idx = context.user_data["idx"]
+    q = QUESTIONS[idx]
+    if q["type"] != "photo":
+        await update.message.reply_text("Дякую! Спершу дайте відповідь на поточне питання 🙂")
+        return ASKING
+    context.user_data["photo_file_id"] = update.message.photo[-1].file_id
+    _record(context, "📷 Фото надіслано")
+    await update.message.reply_text("Дякую за фото! 📷✨")
+    return await _advance(context, update.effective_chat.id)
 
 
 async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -242,6 +267,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data["idx"]
     q = QUESTIONS[idx]
     data = query.data
+
+    # пропустити фото
+    if data == "photoskip" and q["type"] == "photo":
+        _record(context, "— (клієнт надішле фото пізніше)")
+        await query.edit_message_text(f"{_question_text(idx)}\n\n➡️ Пропущено (надішле пізніше)")
+        return await _advance(context, chat_id)
 
     # одиночний вибір
     if data.startswith("c:") and q["type"] == "choice":
@@ -282,6 +313,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["idx"] = 0
         context.user_data["answers"] = {}
         context.user_data["multi"] = set()
+        context.user_data.pop("photo_file_id", None)
         await _send_question(context, query.message.chat.id)
         return ASKING
 
@@ -322,6 +354,17 @@ async def _send_to_admin(update, context):
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+    # фото обличчя клієнта (якщо надіслав)
+    photo_id = context.user_data.get("photo_file_id")
+    if photo_id:
+        client = answers.get("name", "клієнт")
+        await context.bot.send_photo(
+            chat_id=ADMIN_CHAT_ID,
+            photo=photo_id,
+            caption=f"📷 Фото обличчя — {client}",
+        )
+
     log.info("Анкету надіслано власнику (від user_id=%s)", user.id)
 
 
@@ -355,6 +398,7 @@ def main():
             ASKING: [
                 CallbackQueryHandler(on_callback),
                 MessageHandler(filters.CONTACT, on_contact),
+                MessageHandler(filters.PHOTO, on_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
             ],
             CONFIRM: [
