@@ -59,6 +59,7 @@ from telegram.ext import (
 )
 
 import store
+import analyze
 from questions import (
     QUESTIONS,
     GREETING,
@@ -393,6 +394,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _remove_reminder(context, chat_id)
         await _send_to_admins(update, context)
         await query.edit_message_text(DONE_CLIENT)
+        await _send_ai_analysis(update, context)
         _store_anketa(update, context)
         context.user_data.clear()
         return ConversationHandler.END
@@ -447,6 +449,42 @@ async def _send_to_admins(update, context):
         except Exception as e:
             log.warning("Не вдалося надіслати анкету адміну %s: %s", aid, e)
     log.info("Анкету надіслано адмінам %s (від user_id=%s)", ADMIN_IDS, user.id)
+
+
+def _answers_plain(context):
+    answers = context.user_data["answers"]
+    return "\n".join(f"{q['label']}: {answers.get(q['key'], '—')}" for q in QUESTIONS)
+
+
+async def _send_ai_analysis(update, context):
+    """Формує AI-чернетку аналізу (з фото, якщо є) і надсилає адмінам."""
+    if not ADMIN_IDS:
+        return
+    answers_text = _answers_plain(context)
+
+    image_bytes = None
+    photo_id = context.user_data.get("photo_file_id")
+    if photo_id:
+        try:
+            f = await context.bot.get_file(photo_id)
+            image_bytes = bytes(await f.download_as_bytearray())
+        except Exception as e:
+            log.warning("Не вдалося завантажити фото для AI: %s", e)
+
+    analysis = await analyze.build_analysis(answers_text, image_bytes=image_bytes)
+    if not analysis:
+        return  # ключа немає або помилка — мовчки пропускаємо
+
+    name = context.user_data["answers"].get("name", "клієнт")
+    text = (f"🤖 <b>AI-аналіз (чернетка для Анни)</b>\nКлієнт: {html.escape(str(name))}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n" + html.escape(analysis))
+    for aid in ADMIN_IDS:
+        try:
+            await context.bot.send_message(aid, text, parse_mode=ParseMode.HTML,
+                                           disable_web_page_preview=True)
+        except Exception as e:
+            log.warning("Не вдалося надіслати AI-аналіз адміну %s: %s", aid, e)
+    log.info("AI-аналіз надіслано адмінам")
 
 
 def _store_anketa(update, context):
