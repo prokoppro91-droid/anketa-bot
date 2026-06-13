@@ -1,43 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-AI-переданаліз для косметолога (Claude API).
+AI-переданаліз для косметолога.
 
 З відповідей анкети (і фото обличчя, якщо є) формує ЧЕРНЕТКУ попереднього
-аналізу для Анни: ймовірний стан шкіри, на що звернути увагу, можливі
-процедури/догляд, протипоказання-прапорці та що уточнити в клієнта.
+аналізу для Анни: ймовірний стан шкіри, прапорці безпеки, можливі процедури,
+що уточнити. Це підказка фахівцю, а не діагноз.
 
-Це підказка фахівцю, а не діагноз і не рекомендація клієнту.
+Провайдери (за наявності ключа, у порядку пріоритету):
+  • GEMINI_API_KEY    → Google Gemini (БЕЗКОШТОВНИЙ тариф) — за замовчуванням
+  • ANTHROPIC_API_KEY → Claude API (платний) — запасний варіант
 
-Потрібна змінна оточення ANTHROPIC_API_KEY (ключ з platform.claude.com).
-Якщо ключа немає — функція тихо повертає None (бот працює без AI).
+Якщо жодного ключа немає — повертає None, і бот працює без AI.
+Безкоштовний ключ Gemini: https://aistudio.google.com/apikey
 """
 import os
-import base64
 import logging
 
 log = logging.getLogger("anketa-bot.analyze")
 
-# Модель за замовчуванням — найкраща модель Anthropic (текст + зір)
-MODEL = os.environ.get("AI_MODEL", "claude-opus-4-8")
-
-_client = None
-
-
-def _get_client():
-    """Лінива ініціалізація async-клієнта. None, якщо немає ключа/бібліотеки."""
-    global _client
-    if _client is not None:
-        return _client
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return None
-    try:
-        from anthropic import AsyncAnthropic
-    except ImportError:
-        log.warning("Пакет anthropic не встановлено — AI-аналіз вимкнено.")
-        return None
-    _client = AsyncAnthropic()  # читає ANTHROPIC_API_KEY з оточення
-    return _client
-
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+CLAUDE_MODEL = os.environ.get("AI_MODEL", "claude-opus-4-8")
 
 SYSTEM = (
     "Ти — досвідчений лікар-косметолог-консультант. На основі анкети клієнта "
@@ -56,36 +38,66 @@ SYSTEM = (
 )
 
 
+def _user_prompt(answers_text):
+    return (f"Анкета клієнта:\n\n{answers_text}\n\n"
+            "Сформуй чернетку попереднього аналізу за наведеною структурою.")
+
+
 async def build_analysis(answers_text, image_bytes=None, image_media_type="image/jpeg"):
     """Повертає текст аналізу або None (якщо AI недоступний / помилка)."""
-    client = _get_client()
-    if client is None:
+    if os.environ.get("GEMINI_API_KEY"):
+        return await _gemini(answers_text, image_bytes, image_media_type)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return await _claude(answers_text, image_bytes, image_media_type)
+    return None
+
+
+# ── Google Gemini (безкоштовно) ──────────────────────────────────────────────
+async def _gemini(answers_text, image_bytes, mime):
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        log.warning("Пакет google-genai не встановлено — Gemini вимкнено.")
+        return None
+    try:
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        contents = [_user_prompt(answers_text)]
+        if image_bytes:
+            contents.append(types.Part.from_bytes(data=image_bytes, mime_type=mime))
+        resp = await client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM),
+        )
+        return (resp.text or "").strip() or None
+    except Exception as e:
+        log.warning("Gemini-аналіз не вдався: %s", e)
         return None
 
-    content = []
-    if image_bytes:
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": image_media_type,
-                "data": base64.standard_b64encode(image_bytes).decode("utf-8"),
-            },
-        })
-    content.append({
-        "type": "text",
-        "text": (f"Анкета клієнта:\n\n{answers_text}\n\n"
-                 "Сформуй чернетку попереднього аналізу за наведеною структурою."),
-    })
 
+# ── Claude (платний, запасний) ────────────────────────────────────────────────
+async def _claude(answers_text, image_bytes, mime):
     try:
+        from anthropic import AsyncAnthropic
+    except ImportError:
+        return None
+    try:
+        import base64
+        client = AsyncAnthropic()
+        content = []
+        if image_bytes:
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime,
+                           "data": base64.standard_b64encode(image_bytes).decode("utf-8")},
+            })
+        content.append({"type": "text", "text": _user_prompt(answers_text)})
         resp = await client.messages.create(
-            model=MODEL,
-            max_tokens=2000,
-            system=SYSTEM,
+            model=CLAUDE_MODEL, max_tokens=2000, system=SYSTEM,
             messages=[{"role": "user", "content": content}],
         )
-        return "".join(b.text for b in resp.content if b.type == "text").strip()
+        return "".join(b.text for b in resp.content if b.type == "text").strip() or None
     except Exception as e:
-        log.warning("AI-аналіз не вдався: %s", e)
+        log.warning("Claude-аналіз не вдався: %s", e)
         return None
