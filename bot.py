@@ -4,22 +4,29 @@
 
 Сценарій:
   1. Людина переходить за посиланням з Instagram → потрапляє в бота.
-  2. Бот по черзі ставить питання (кнопки з варіантами + місце для своєї відповіді).
+  2. Бот по черзі ставить питання (кнопки з варіантами + місце для своєї відповіді, фото).
   3. Формує анкету одним текстом і перепитує клієнта, чи все вірно.
-  4. Після підтвердження надсилає анкету власнику в Telegram —
-     з номером телефону клієнта та його @username для зворотного зв'язку.
+  4. Після підтвердження надсилає анкету адміністратору(-ам) у Telegram.
+
+Можливості:
+  • кнопки дій під анкетою (написати клієнту / записати / передзвонити);
+  • виправлення однієї відповіді на етапі підтвердження;
+  • нагадування, якщо клієнт кинув анкету на півдорозі;
+  • кілька адміністраторів + /stats;
+  • збір відгуку через N днів після анкети (з фото результату).
 
 Запуск:   python bot.py
-Потрібні змінні оточення: BOT_TOKEN, ADMIN_CHAT_ID  (див. README.md та .env.example)
+Змінні оточення: BOT_TOKEN, ADMIN_CHAT_IDS (або ADMIN_CHAT_ID),
+                 FEEDBACK_DAYS (за замовч. 10), REMIND_MINUTES (за замовч. 60)
 """
 
 import os
+import re
 import sys
+import time
 import html
 import logging
 
-# Windows: консоль за замовчуванням cp1251 — переводимо вивід у UTF-8,
-# щоб емодзі в логах не валили програму.
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
@@ -28,7 +35,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # підхоплює .env при локальному запуску (у хмарі ігнорується)
+    load_dotenv()
 except ImportError:
     pass
 
@@ -51,6 +58,7 @@ from telegram.ext import (
     filters,
 )
 
+import store
 from questions import (
     QUESTIONS,
     GREETING,
@@ -65,10 +73,16 @@ from questions import (
 
 # ── Налаштування з оточення ─────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-try:
-    ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
-except ValueError:
-    ADMIN_CHAT_ID = 0
+
+
+def _parse_ids(s):
+    return [int(x) for x in re.split(r"[ ,;]+", (s or "").strip())
+            if x.strip().lstrip("-").isdigit()]
+
+
+ADMIN_IDS = _parse_ids(os.environ.get("ADMIN_CHAT_IDS")) or _parse_ids(os.environ.get("ADMIN_CHAT_ID"))
+FEEDBACK_DELAY = float(os.environ.get("FEEDBACK_DAYS", "10")) * 86400
+REMIND_AFTER = float(os.environ.get("REMIND_MINUTES", "60")) * 60
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -79,10 +93,21 @@ log = logging.getLogger("anketa-bot")
 # ── Стани розмови ───────────────────────────────────────────────────────────
 ASKING, CONFIRM = range(2)
 
+# ── Додаткові тексти UI ─────────────────────────────────────────────────────
+EDIT_BUTTON = "✏️ Виправити один пункт"
+EDIT_PROMPT = "Який пункт виправити? 👇"
+EDIT_BACK = "⬅️ Назад до анкети"
+REMIND_TEXT = ("Ви не завершили анкету 🌸 Давайте продовжимо — це займе хвилинку 💆‍♀️\n"
+               "Натисніть /start, щоб почати заново.")
+FEEDBACK_TEXT = ("Вітаю! 🌸 Минув час після візиту до Анни 💆‍♀️\n"
+                 "Як ваші враження від процедури? Поділіться, будь ласка, відгуком 💬\n"
+                 "За бажанням — надішліть фото результату 📸 (зі згодою на публікацію). "
+                 "Нам це дуже важливо! 💖")
+FEEDBACK_THANKS = "Дякуємо за ваш відгук! 💖🌸 Анні буде дуже приємно."
 
-# ── Допоміжне ────────────────────────────────────────────────────────────────
+
+# ── Клавіатури / питання ─────────────────────────────────────────────────────
 def _build_keyboard(q, selected=None):
-    """Повертає reply_markup для поточного питання."""
     qtype = q["type"]
 
     if qtype == "choice":
@@ -108,7 +133,6 @@ def _build_keyboard(q, selected=None):
             [[InlineKeyboardButton("⏭️ Пропустити (надішлю пізніше)", callback_data="photoskip")]]
         )
 
-    # text
     return ReplyKeyboardRemove()
 
 
@@ -124,6 +148,7 @@ async def _send_question(context, chat_id):
     idx = context.user_data["idx"]
     q = QUESTIONS[idx]
     context.user_data["multi"] = set()
+    _schedule_reminder(context, chat_id)
     await context.bot.send_message(
         chat_id=chat_id,
         text=_question_text(idx),
@@ -132,7 +157,6 @@ async def _send_question(context, chat_id):
 
 
 def _record(context, value):
-    """Зберігає відповідь на поточне питання."""
     idx = context.user_data["idx"]
     q = QUESTIONS[idx]
     context.user_data["answers"][q["key"]] = value
@@ -141,7 +165,9 @@ def _record(context, value):
 
 
 async def _advance(context, chat_id):
-    """Переходить до наступного питання або до підтвердження."""
+    # режим редагування одного пункту → одразу назад до підсумку
+    if context.user_data.pop("editing", False):
+        return await _show_summary(context, chat_id)
     context.user_data["idx"] += 1
     if context.user_data["idx"] < len(QUESTIONS):
         await _send_question(context, chat_id)
@@ -149,6 +175,7 @@ async def _advance(context, chat_id):
     return await _show_summary(context, chat_id)
 
 
+# ── Підсумок / підтвердження ──────────────────────────────────────────────────
 def _summary_lines(context):
     answers = context.user_data["answers"]
     lines = []
@@ -158,20 +185,58 @@ def _summary_lines(context):
     return lines
 
 
-async def _show_summary(context, chat_id):
-    text = CONFIRM_INTRO + "\n\n" + "\n".join(_summary_lines(context))
-    kb = InlineKeyboardMarkup([
+def _confirm_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(CONFIRM_YES, callback_data="ok")],
+        [InlineKeyboardButton(EDIT_BUTTON, callback_data="edit")],
         [InlineKeyboardButton(CONFIRM_REDO, callback_data="redo")],
     ])
+
+
+def _edit_list_keyboard():
+    rows = [[InlineKeyboardButton(f"{q['label']}", callback_data=f"edf:{i}")]
+            for i, q in enumerate(QUESTIONS)]
+    rows.append([InlineKeyboardButton(EDIT_BACK, callback_data="editback")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_summary(context, chat_id):
+    text = CONFIRM_INTRO + "\n\n" + "\n".join(_summary_lines(context))
     await context.bot.send_message(chat_id=chat_id, text=text,
-                                   reply_markup=kb, parse_mode=ParseMode.HTML)
+                                   reply_markup=_confirm_keyboard(),
+                                   parse_mode=ParseMode.HTML)
     return CONFIRM
 
 
-# ── Хендлери ─────────────────────────────────────────────────────────────────
+# ── Нагадування про незавершену анкету ────────────────────────────────────────
+def _schedule_reminder(context, chat_id):
+    jq = getattr(context, "job_queue", None)
+    if not jq:
+        return
+    for j in jq.get_jobs_by_name(f"r{chat_id}"):
+        j.schedule_removal()
+    jq.run_once(_reminder_job, REMIND_AFTER, chat_id=chat_id, name=f"r{chat_id}")
+
+
+def _remove_reminder(context, chat_id):
+    jq = getattr(context, "job_queue", None)
+    if not jq:
+        return
+    for j in jq.get_jobs_by_name(f"r{chat_id}"):
+        j.schedule_removal()
+
+
+async def _reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(context.job.chat_id, REMIND_TEXT)
+
+
+# ── Хендлери розмови ──────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    u = update.effective_user
+    log.info("START chat_id=%s name=%s username=%s", update.effective_chat.id,
+             u.full_name, u.username)
+    context.user_data["source"] = context.args[0] if context.args else "напряму"
     kb = ReplyKeyboardMarkup([[KeyboardButton(START_BUTTON)]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(GREETING, reply_markup=kb)
@@ -184,7 +249,7 @@ async def begin_survey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["answers"] = {}
     context.user_data["multi"] = set()
     context.user_data.pop("awaiting_start", None)
-    await update.message.reply_text("Поїхали! 🚀", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Поїхали! 🚀💖", reply_markup=ReplyKeyboardRemove())
     await _send_question(context, update.effective_chat.id)
     return ASKING
 
@@ -193,11 +258,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
-    # Очікуємо натискання «Почати анкету»
     if context.user_data.get("awaiting_start"):
-        if text == START_BUTTON:
-            return await begin_survey(update, context)
-        # будь-який текст теж починає анкету
         return await begin_survey(update, context)
 
     if "idx" not in context.user_data:
@@ -219,15 +280,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if qtype == "photo":
         await update.message.reply_text(
-            "Надішліть, будь ласка, саме фото 📷 або натисніть «Пропустити» 👇"
-        )
+            "Надішліть, будь ласка, саме фото 📷 або натисніть «Пропустити» 👇")
         return ASKING
 
     if qtype in ("choice", "multichoice") and q.get("allow_custom"):
         _record(context, text)
         return await _advance(context, chat_id)
 
-    # choice/multichoice без власного варіанту
     await update.message.reply_text("Будь ласка, скористайтеся кнопками вище 👆")
     return ASKING
 
@@ -249,8 +308,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "idx" not in context.user_data:
         return ASKING
-    phone = update.message.contact.phone_number
-    _record(context, phone)
+    _record(context, update.message.contact.phone_number)
     await update.message.reply_text("Дякую 👍", reply_markup=ReplyKeyboardRemove())
     return await _advance(context, update.effective_chat.id)
 
@@ -268,20 +326,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = QUESTIONS[idx]
     data = query.data
 
-    # пропустити фото
     if data == "photoskip" and q["type"] == "photo":
         _record(context, "— (клієнт надішле фото пізніше)")
         await query.edit_message_text(f"{_question_text(idx)}\n\n➡️ Пропущено (надішле пізніше)")
         return await _advance(context, chat_id)
 
-    # одиночний вибір
     if data.startswith("c:") and q["type"] == "choice":
         opt = q["options"][int(data[2:])]
         _record(context, opt)
         await query.edit_message_text(f"{_question_text(idx)}\n\n➡️ {opt}")
         return await _advance(context, chat_id)
 
-    # мультивибір — перемикання
     if data.startswith("m:") and q["type"] == "multichoice":
         i = int(data[2:])
         sel = context.user_data.setdefault("multi", set())
@@ -289,12 +344,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=_build_keyboard(q, sel))
         return ASKING
 
-    # мультивибір — готово
     if data == "mdone" and q["type"] == "multichoice":
         sel = context.user_data.get("multi", set())
         if not sel:
-            await query.answer("Оберіть хоча б один варіант або напишіть свій 🙂",
-                               show_alert=True)
+            await query.answer("Оберіть хоча б один варіант або напишіть свій 🙂", show_alert=True)
             return ASKING
         chosen = ", ".join(q["options"][i] for i in sorted(sel))
         _record(context, chosen)
@@ -307,68 +360,181 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data
+    chat_id = query.message.chat.id
 
-    if query.data == "redo":
+    if data == "redo":
         await query.edit_message_text("Гаразд, починаємо спочатку 🔄")
         context.user_data["idx"] = 0
         context.user_data["answers"] = {}
         context.user_data["multi"] = set()
         context.user_data.pop("photo_file_id", None)
-        await _send_question(context, query.message.chat.id)
+        await _send_question(context, chat_id)
         return ASKING
 
-    # підтверджено — надсилаємо власнику
-    await _send_to_admin(update, context)
-    await query.edit_message_text(DONE_CLIENT)
-    context.user_data.clear()
-    return ConversationHandler.END
+    if data == "edit":
+        await query.edit_message_text(EDIT_PROMPT, reply_markup=_edit_list_keyboard())
+        return CONFIRM
+
+    if data == "editback":
+        text = CONFIRM_INTRO + "\n\n" + "\n".join(_summary_lines(context))
+        await query.edit_message_text(text, reply_markup=_confirm_keyboard(),
+                                      parse_mode=ParseMode.HTML)
+        return CONFIRM
+
+    if data.startswith("edf:"):
+        context.user_data["idx"] = int(data[4:])
+        context.user_data["editing"] = True
+        await query.edit_message_text("Гаразд, виправимо цей пункт 👇")
+        await _send_question(context, chat_id)
+        return ASKING
+
+    if data == "ok":
+        _remove_reminder(context, chat_id)
+        await _send_to_admins(update, context)
+        await query.edit_message_text(DONE_CLIENT)
+        _store_anketa(update, context)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    return CONFIRM
 
 
-async def _send_to_admin(update, context):
+# ── Надсилання анкети адміністраторам ─────────────────────────────────────────
+def _admin_keyboard(user):
+    if user.username:
+        write_url = f"https://t.me/{user.username}"
+    else:
+        write_url = f"tg://user?id={user.id}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Написати клієнту", url=write_url)],
+        [InlineKeyboardButton("✅ Записати", callback_data=f"adm:book:{user.id}"),
+         InlineKeyboardButton("⏳ Передзвонити", callback_data=f"adm:call:{user.id}")],
+    ])
+
+
+async def _send_to_admins(update, context):
     user = update.effective_user
     answers = context.user_data["answers"]
     phone = context.user_data.get("phone", answers.get("phone", "—"))
-
     username = f"@{user.username}" if user.username else "немає username"
     tg_name = html.escape(user.full_name or "—")
-
-    # посилання для зворотного зв'язку
-    if user.username:
-        link = f'<a href="https://t.me/{user.username}">написати клієнту</a>'
-    else:
-        link = f'<a href="tg://user?id={user.id}">написати клієнту</a>'
 
     header = (
         "🆕 <b>НОВА АНКЕТА КЛІЄНТА</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📱 <b>Телефон:</b> {html.escape(str(phone))}\n"
         f"👤 <b>Telegram:</b> {tg_name} ({html.escape(username)})\n"
-        f"💬 <b>Зв'язок:</b> {link}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
     )
     body = "\n".join(_summary_lines(context))
-
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=header + body,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-
-    # фото обличчя клієнта (якщо надіслав)
+    text = header + body
     photo_id = context.user_data.get("photo_file_id")
-    if photo_id:
-        client = answers.get("name", "клієнт")
-        await context.bot.send_photo(
-            chat_id=ADMIN_CHAT_ID,
-            photo=photo_id,
-            caption=f"📷 Фото обличчя — {client}",
-        )
+    kb = _admin_keyboard(user)
 
-    log.info("Анкету надіслано власнику (від user_id=%s)", user.id)
+    if not ADMIN_IDS:
+        log.warning("⚠️ ADMIN_IDS порожній — нікому надсилати анкету!")
+        return
+
+    for aid in ADMIN_IDS:
+        try:
+            await context.bot.send_message(aid, text, parse_mode=ParseMode.HTML,
+                                           reply_markup=kb, disable_web_page_preview=True)
+            if photo_id:
+                await context.bot.send_photo(
+                    aid, photo_id,
+                    caption=f"📷 Фото обличчя — {html.escape(answers.get('name', 'клієнт'))}")
+        except Exception as e:
+            log.warning("Не вдалося надіслати анкету адміну %s: %s", aid, e)
+    log.info("Анкету надіслано адмінам %s (від user_id=%s)", ADMIN_IDS, user.id)
+
+
+def _store_anketa(update, context):
+    user = update.effective_user
+    name = context.user_data["answers"].get("name", "—")
+    source = context.user_data.get("source", "напряму")
+    try:
+        store.add_anketa(user.id, name, user.username, source, FEEDBACK_DELAY)
+    except Exception as e:
+        log.warning("Не вдалося зберегти анкету у store: %s", e)
+
+
+# ── Кнопки дій адміна під анкетою ─────────────────────────────────────────────
+async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, action, _uid = query.data.split(":")
+    except ValueError:
+        return
+    status = {"book": "✅ Записаний", "call": "⏳ Передзвонити"}.get(action, "")
+    who = html.escape(update.effective_user.full_name or "адмін")
+    stamp = time.strftime("%d.%m %H:%M")
+
+    base = query.message.text_html or query.message.text or ""
+    marker = "\n\n📌 "
+    if marker in base:
+        base = base[:base.index(marker)]
+    new_text = f"{base}{marker}<b>{status}</b> · {who} · {stamp}"
+    try:
+        await query.edit_message_text(new_text, parse_mode=ParseMode.HTML,
+                                      reply_markup=query.message.reply_markup,
+                                      disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("admin action edit fail: %s", e)
+
+
+# ── Відгуки через N днів ──────────────────────────────────────────────────────
+async def feedback_checker(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    for entry in store.due_feedback(now):
+        try:
+            await context.bot.send_message(entry["uid"], FEEDBACK_TEXT)
+            store.mark_feedback_sent(entry["uid"], entry["due"])
+            log.info("Надіслано запит відгуку клієнту %s", entry["uid"])
+        except Exception as e:
+            log.warning("Не вдалося надіслати запит відгуку %s: %s", entry["uid"], e)
+
+
+async def on_free_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повідомлення поза анкетою: якщо чекаємо відгук — пересилаємо адмінам."""
+    user = update.effective_user
+    if store.is_awaiting_feedback(user.id):
+        username = f"@{user.username}" if user.username else "немає username"
+        head = (f"💬 <b>ВІДГУК від клієнта</b>\n"
+                f"👤 {html.escape(user.full_name or '—')} ({html.escape(username)})")
+        for aid in ADMIN_IDS:
+            try:
+                await context.bot.send_message(aid, head, parse_mode=ParseMode.HTML)
+                await context.bot.copy_message(aid, update.effective_chat.id,
+                                                update.message.message_id)
+            except Exception as e:
+                log.warning("Не вдалося переслати відгук адміну %s: %s", aid, e)
+        store.clear_awaiting(user.id)
+        await update.message.reply_text(FEEDBACK_THANKS)
+    else:
+        await update.message.reply_text("Напишіть /start, щоб заповнити анкету 🙂")
+
+
+# ── Команди ───────────────────────────────────────────────────────────────────
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Ця команда лише для адміністратора 🔒")
+        return
+    s = store.stats()
+    lines = ["📊 <b>Статистика анкет</b>",
+             f"Усього: <b>{s['total']}</b>",
+             f"Сьогодні: <b>{s['today']}</b>",
+             f"За 7 днів: <b>{s['week']}</b>"]
+    if s["by_source"]:
+        lines.append("\n<b>Джерела:</b>")
+        for src, n in sorted(s["by_source"].items(), key=lambda x: -x[1]):
+            lines.append(f"• {html.escape(src)}: {n}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _remove_reminder(context, update.effective_chat.id)
     context.user_data.clear()
     await update.message.reply_text("Анкету скасовано. Напишіть /start, щоб почати знову.",
                                     reply_markup=ReplyKeyboardRemove())
@@ -376,19 +542,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Допоміжна команда: показує ваш chat_id (щоб вписати в ADMIN_CHAT_ID)."""
     await update.message.reply_text(
-        f"Ваш chat_id: {update.effective_chat.id}\n"
-        "Впишіть це число у змінну ADMIN_CHAT_ID."
-    )
+        f"Ваш chat_id: {update.effective_chat.id}\nВпишіть це число у ADMIN_CHAT_IDS.")
 
 
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ Не задано BOT_TOKEN. Див. README.md")
-    if not ADMIN_CHAT_ID:
-        log.warning("⚠️ ADMIN_CHAT_ID не задано — анкети нікому не надсилатимуться. "
-                    "Напишіть боту /whoami, щоб дізнатися свій chat_id.")
+    if not ADMIN_IDS:
+        log.warning("⚠️ ADMIN_IDS не задано — анкети нікому не надсилатимуться. "
+                    "Напишіть боту /whoami і впишіть число у ADMIN_CHAT_IDS.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -396,13 +559,13 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             ASKING: [
-                CallbackQueryHandler(on_callback),
+                CallbackQueryHandler(on_callback, pattern=r"^(c:|m:|mdone|photoskip)"),
                 MessageHandler(filters.CONTACT, on_contact),
                 MessageHandler(filters.PHOTO, on_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
             ],
             CONFIRM: [
-                CallbackQueryHandler(on_confirm),
+                CallbackQueryHandler(on_confirm, pattern=r"^(ok|redo|edit|editback|edf:)"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
@@ -410,9 +573,16 @@ def main():
     )
 
     app.add_handler(conv)
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CallbackQueryHandler(on_admin_action, pattern=r"^adm:"))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, on_free_message))
 
-    log.info("✅ Бот запущено. Очікую повідомлення…")
+    # періодична перевірка черги відгуків (щогодини)
+    if app.job_queue:
+        app.job_queue.run_repeating(feedback_checker, interval=3600, first=15)
+
+    log.info("✅ Бот запущено. Адміни: %s. Очікую повідомлення…", ADMIN_IDS)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
