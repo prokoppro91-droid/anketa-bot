@@ -137,12 +137,27 @@ def _build_keyboard(q, selected=None):
     return ReplyKeyboardRemove()
 
 
-def _question_text(idx):
+def _question_text(context, idx):
     q = QUESTIONS[idx]
-    head = f"❓ Питання {idx + 1} з {len(QUESTIONS)}\n\n{q['text']}"
+    num = len(context.user_data.get("answers", {})) + 1
+    head = f"❓ Питання {num}\n\n{q['text']}"
     if q["type"] in ("choice", "multichoice") and q.get("allow_custom"):
         head += "\n\n✍️ Або напишіть свій варіант повідомленням."
     return head
+
+
+def _should_ask(context, q):
+    """Чи показувати питання (розгалуження): True, якщо немає умови ask_if
+    або умова виконана попередньою відповіддю."""
+    cond = q.get("ask_if")
+    if not cond:
+        return True
+    ans = context.user_data.get("answers", {}).get(cond["key"], "")
+    if "equals" in cond:
+        return ans == cond["equals"]
+    if "contains" in cond:
+        return cond["contains"] in ans
+    return True
 
 
 async def _send_question(context, chat_id):
@@ -152,7 +167,7 @@ async def _send_question(context, chat_id):
     _schedule_reminder(context, chat_id)
     await context.bot.send_message(
         chat_id=chat_id,
-        text=_question_text(idx),
+        text=_question_text(context, idx),
         reply_markup=_build_keyboard(q),
     )
 
@@ -169,8 +184,12 @@ async def _advance(context, chat_id):
     # режим редагування одного пункту → одразу назад до підсумку
     if context.user_data.pop("editing", False):
         return await _show_summary(context, chat_id)
-    context.user_data["idx"] += 1
-    if context.user_data["idx"] < len(QUESTIONS):
+    idx = context.user_data["idx"] + 1
+    # пропустити неактуальні питання (розгалуження ask_if)
+    while idx < len(QUESTIONS) and not _should_ask(context, QUESTIONS[idx]):
+        idx += 1
+    context.user_data["idx"] = idx
+    if idx < len(QUESTIONS):
         await _send_question(context, chat_id)
         return ASKING
     return await _show_summary(context, chat_id)
@@ -181,7 +200,9 @@ def _summary_lines(context):
     answers = context.user_data["answers"]
     lines = []
     for q in QUESTIONS:
-        val = answers.get(q["key"], "—")
+        if q["key"] not in answers:
+            continue  # пропущене (розгалуження) — не показуємо
+        val = answers[q["key"]]
         lines.append(f"<b>{html.escape(q['label'])}:</b> {html.escape(str(val))}")
     return lines
 
@@ -194,9 +215,10 @@ def _confirm_keyboard():
     ])
 
 
-def _edit_list_keyboard():
+def _edit_list_keyboard(context):
+    answers = context.user_data.get("answers", {})
     rows = [[InlineKeyboardButton(f"{q['label']}", callback_data=f"edf:{i}")]
-            for i, q in enumerate(QUESTIONS)]
+            for i, q in enumerate(QUESTIONS) if q["key"] in answers]
     rows.append([InlineKeyboardButton(EDIT_BACK, callback_data="editback")])
     return InlineKeyboardMarkup(rows)
 
@@ -329,13 +351,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "photoskip" and q["type"] == "photo":
         _record(context, "— (клієнт надішле фото пізніше)")
-        await query.edit_message_text(f"{_question_text(idx)}\n\n➡️ Пропущено (надішле пізніше)")
+        await query.edit_message_text(f"{_question_text(context, idx)}\n\n➡️ Пропущено (надішле пізніше)")
         return await _advance(context, chat_id)
 
     if data.startswith("c:") and q["type"] == "choice":
         opt = q["options"][int(data[2:])]
         _record(context, opt)
-        await query.edit_message_text(f"{_question_text(idx)}\n\n➡️ {opt}")
+        await query.edit_message_text(f"{_question_text(context, idx)}\n\n➡️ {opt}")
         return await _advance(context, chat_id)
 
     if data.startswith("m:") and q["type"] == "multichoice":
@@ -352,7 +374,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ASKING
         chosen = ", ".join(q["options"][i] for i in sorted(sel))
         _record(context, chosen)
-        await query.edit_message_text(f"{_question_text(idx)}\n\n➡️ {chosen}")
+        await query.edit_message_text(f"{_question_text(context, idx)}\n\n➡️ {chosen}")
         return await _advance(context, chat_id)
 
     return ASKING
@@ -374,7 +396,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASKING
 
     if data == "edit":
-        await query.edit_message_text(EDIT_PROMPT, reply_markup=_edit_list_keyboard())
+        await query.edit_message_text(EDIT_PROMPT, reply_markup=_edit_list_keyboard(context))
         return CONFIRM
 
     if data == "editback":
