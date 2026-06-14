@@ -14,9 +14,14 @@ AI-переданаліз для косметолога.
 Безкоштовний ключ Gemini: https://aistudio.google.com/apikey
 """
 import os
+import asyncio
 import logging
 
 log = logging.getLogger("anketa-bot.analyze")
+
+# Запасні моделі, якщо основна тимчасово перевантажена (503/429)
+GEMINI_FALLBACKS = ["gemini-2.0-flash", "gemini-2.5-flash-lite"]
+_TRANSIENT = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "500", "INTERNAL")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 CLAUDE_MODEL = os.environ.get("AI_MODEL", "claude-opus-4-8")
@@ -65,15 +70,33 @@ async def _gemini(answers_text, image_bytes, mime):
         contents = [_user_prompt(answers_text)]
         if image_bytes:
             contents.append(types.Part.from_bytes(data=image_bytes, mime_type=mime))
-        resp = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM),
-        )
-        return (resp.text or "").strip() or None
+        cfg = types.GenerateContentConfig(system_instruction=SYSTEM)
     except Exception as e:
-        log.warning("Gemini-аналіз не вдався: %s", e)
+        log.warning("Gemini: помилка ініціалізації: %s", e)
         return None
+
+    last_err = None
+    # Пробуємо основну модель, потім запасні; на тимчасові збої — повтори з паузою
+    for model in [GEMINI_MODEL, *GEMINI_FALLBACKS]:
+        for attempt in range(3):
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=model, contents=contents, config=cfg)
+                txt = (resp.text or "").strip()
+                if txt:
+                    if model != GEMINI_MODEL:
+                        log.info("Gemini: відповіла запасна модель %s", model)
+                    return txt
+                last_err = "порожня відповідь"
+                break  # порожньо — пробуємо наступну модель
+            except Exception as e:
+                last_err = e
+                if any(code in str(e) for code in _TRANSIENT):
+                    await asyncio.sleep(1.5 * (attempt + 1))  # 1.5с, 3с
+                    continue
+                break  # не тимчасова помилка — до наступної моделі
+    log.warning("Gemini-аналіз не вдався (усі спроби): %s", last_err)
+    return None
 
 
 # ── Claude (платний, запасний) ────────────────────────────────────────────────
