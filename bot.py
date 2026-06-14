@@ -473,6 +473,23 @@ async def _send_to_admins(update, context):
     log.info("Анкету надіслано адмінам %s (від user_id=%s)", ADMIN_IDS, user.id)
 
 
+def _split_message(text, limit=3900):
+    """Ділить текст на частини ≤ limit символів за межами рядків
+    (тіло AI-аналізу екрановане, тегів усередині немає — розрив безпечний)."""
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:  # дуже довгий рядок без переносів
+            if cur:
+                parts.append(cur); cur = ""
+            parts.append(line[:limit]); line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            parts.append(cur); cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        parts.append(cur)
+    return parts or [text]
+
+
 def _answers_plain(context):
     answers = context.user_data["answers"]
     return "\n".join(f"{q['label']}: {answers.get(q['key'], '—')}" for q in QUESTIONS)
@@ -500,13 +517,16 @@ async def _send_ai_analysis(update, context):
     name = context.user_data["answers"].get("name", "клієнт")
     text = (f"🤖 <b>AI-аналіз (чернетка для Анни)</b>\nКлієнт: {html.escape(str(name))}\n"
             "━━━━━━━━━━━━━━━━━━━━\n" + html.escape(analysis))
+    # Telegram обмежує повідомлення 4096 символами — ріжемо на частини
+    chunks = _split_message(text, 3900)
     for aid in ADMIN_IDS:
-        try:
-            await context.bot.send_message(aid, text, parse_mode=ParseMode.HTML,
-                                           disable_web_page_preview=True)
-        except Exception as e:
-            log.warning("Не вдалося надіслати AI-аналіз адміну %s: %s", aid, e)
-    log.info("AI-аналіз надіслано адмінам")
+        for ch in chunks:
+            try:
+                await context.bot.send_message(aid, ch, parse_mode=ParseMode.HTML,
+                                               disable_web_page_preview=True)
+            except Exception as e:
+                log.warning("Не вдалося надіслати AI-аналіз адміну %s: %s", aid, e)
+    log.info("AI-аналіз надіслано адмінам (%d част.)", len(chunks))
 
 
 def _store_anketa(update, context):
