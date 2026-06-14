@@ -82,6 +82,8 @@ def _parse_ids(s):
 
 
 ADMIN_IDS = _parse_ids(os.environ.get("ADMIN_CHAT_IDS")) or _parse_ids(os.environ.get("ADMIN_CHAT_ID"))
+# Кому дозволено надсилати фото боту для AI-аналізу (за замовч. — ті ж адміни)
+ANALYST_IDS = _parse_ids(os.environ.get("ANALYST_CHAT_IDS")) or ADMIN_IDS
 FEEDBACK_DELAY = float(os.environ.get("FEEDBACK_DAYS", "10")) * 86400
 REMIND_AFTER = float(os.environ.get("REMIND_MINUTES", "60")) * 60
 
@@ -577,8 +579,31 @@ async def feedback_checker(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_free_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Повідомлення поза анкетою: якщо чекаємо відгук — пересилаємо адмінам."""
+    """Повідомлення поза анкетою: фото від аналітика → AI-аналіз;
+    відгук від клієнта → пересилаємо адмінам; інше → підказка."""
     user = update.effective_user
+
+    # Аналітик (Анна/власник) надіслав фото → AI-аналіз цього фото
+    if update.message.photo and user.id in ANALYST_IDS:
+        await update.message.reply_text("🔎 Аналізую фото… (кілька секунд)")
+        try:
+            f = await context.bot.get_file(update.message.photo[-1].file_id)
+            img = bytes(await f.download_as_bytearray())
+        except Exception as e:
+            log.warning("Аналітик: не вдалося завантажити фото: %s", e)
+            await update.message.reply_text("😕 Не вдалося завантажити фото. Спробуйте ще раз.")
+            return
+        ctx_text = (update.message.caption or "").strip() or \
+            "Аналіз лише за фото (анкета недоступна). Оціни стан шкіри за зображенням."
+        analysis = await analyze.build_analysis(ctx_text, image_bytes=img)
+        if not analysis:
+            await update.message.reply_text("AI зараз недоступний — спробуйте трохи пізніше.")
+            return
+        head = "🤖 <b>AI-аналіз за фото</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        for ch in _split_message(head + html.escape(analysis), 3900):
+            await update.message.reply_text(ch, parse_mode=ParseMode.HTML,
+                                            disable_web_page_preview=True)
+        return
     if store.is_awaiting_feedback(user.id):
         username = f"@{user.username}" if user.username else "немає username"
         head = (f"💬 <b>ВІДГУК від клієнта</b>\n"
