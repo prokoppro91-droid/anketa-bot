@@ -663,7 +663,7 @@ def main():
             webhook_url=f"{external.rstrip('/')}/hook",
             secret_token=secret,
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
+            drop_pending_updates=False,
         )
     else:
         # Локальний режим: звичайний polling.
