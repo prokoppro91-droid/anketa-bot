@@ -30,18 +30,24 @@ def _save(d):
     DATA.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def add_anketa(uid, name, username, source, feedback_delay):
+def add_anketa(uid, name, username, source, feedback_delay, answers_text=""):
     """Зберігає анкету і ставить у чергу запит відгуку через feedback_delay секунд."""
     d = _load()
     now = time.time()
     d["anketas"].append({
         "ts": now, "uid": uid, "name": name,
-        "username": username, "source": source,
+        "username": username, "source": source, "answers": answers_text,
     })
     d["feedback"].append({
         "uid": uid, "name": name, "due": now + feedback_delay, "sent": False,
     })
     _save(d)
+
+
+def last_anketa(uid):
+    """Остання анкета цього клієнта (або None) — для прив'язки пізнішого фото."""
+    items = [a for a in _load().get("anketas", []) if a.get("uid") == uid]
+    return items[-1] if items else None
 
 
 def stats():

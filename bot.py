@@ -536,7 +536,8 @@ def _store_anketa(update, context):
     name = context.user_data["answers"].get("name", "—")
     source = context.user_data.get("source", "напряму")
     try:
-        store.add_anketa(user.id, name, user.username, source, FEEDBACK_DELAY)
+        store.add_anketa(user.id, name, user.username, source, FEEDBACK_DELAY,
+                         answers_text=_answers_plain(context))
     except Exception as e:
         log.warning("Не вдалося зберегти анкету у store: %s", e)
 
@@ -578,6 +579,25 @@ async def feedback_checker(context: ContextTypes.DEFAULT_TYPE):
             log.warning("Не вдалося надіслати запит відгуку %s: %s", entry["uid"], e)
 
 
+async def _push_analysis_to_admins(context, client_label, answers_text, image_bytes):
+    """Будує AI-аналіз (фото + контекст анкети) і шле адмінам частинами."""
+    analysis = await analyze.build_analysis(
+        answers_text or "Аналіз лише за фото (анкета недоступна). Оціни стан шкіри за зображенням.",
+        image_bytes=image_bytes)
+    if not analysis:
+        return False
+    head = (f"🤖 <b>AI-аналіз за фото</b>\nКлієнт: {html.escape(str(client_label))}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n")
+    for aid in ADMIN_IDS:
+        for ch in _split_message(head + html.escape(analysis), 3900):
+            try:
+                await context.bot.send_message(aid, ch, parse_mode=ParseMode.HTML,
+                                                disable_web_page_preview=True)
+            except Exception as e:
+                log.warning("AI-аналіз адміну %s не надіслано: %s", aid, e)
+    return True
+
+
 async def on_free_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Повідомлення поза анкетою: фото від аналітика → AI-аналіз;
     відгук від клієнта → пересилаємо адмінам; інше → підказка."""
@@ -617,6 +637,28 @@ async def on_free_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.warning("Не вдалося переслати відгук адміну %s: %s", aid, e)
         store.clear_awaiting(user.id)
         await update.message.reply_text(FEEDBACK_THANKS)
+    elif update.message.photo:
+        # Клієнт надіслав фото ПІСЛЯ анкети (напр. тиснув «надішлю пізніше»)
+        await update.message.reply_text("Дякую! Передаю фото Анні… 📷")
+        rec = store.last_anketa(user.id)
+        name = (rec or {}).get("name") or user.full_name or "клієнт"
+        uname = f"@{user.username}" if user.username else "—"
+        fid = update.message.photo[-1].file_id
+        for aid in ADMIN_IDS:
+            try:
+                await context.bot.send_photo(
+                    aid, fid,
+                    caption=(f"📷 Фото клієнта (надіслане після анкети)\n"
+                             f"👤 {html.escape(name)} ({html.escape(uname)})"))
+            except Exception as e:
+                log.warning("Не вдалося переслати фото клієнта адміну %s: %s", aid, e)
+        try:
+            f = await context.bot.get_file(fid)
+            img = bytes(await f.download_as_bytearray())
+            await _push_analysis_to_admins(context, name, (rec or {}).get("answers", ""), img)
+        except Exception as e:
+            log.warning("AI для пізнього фото не вдався: %s", e)
+        await update.message.reply_text("Готово — фото передала Анні 💖✨")
     else:
         await update.message.reply_text("Напишіть /start, щоб заповнити анкету 🙂")
 
