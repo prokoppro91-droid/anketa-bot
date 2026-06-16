@@ -23,9 +23,12 @@
 import os
 import re
 import sys
+import json
 import time
 import html
+import asyncio
 import logging
+import urllib.request
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -86,6 +89,10 @@ ADMIN_IDS = _parse_ids(os.environ.get("ADMIN_CHAT_IDS")) or _parse_ids(os.enviro
 ANALYST_IDS = _parse_ids(os.environ.get("ANALYST_CHAT_IDS")) or ADMIN_IDS
 FEEDBACK_DELAY = float(os.environ.get("FEEDBACK_DAYS", "10")) * 86400
 REMIND_AFTER = float(os.environ.get("REMIND_MINUTES", "60")) * 60
+
+# Google Sheets (через Apps Script web app) — кожна анкета лягає рядком у таблицю
+SHEETS_URL = os.environ.get("SHEETS_WEBHOOK_URL", "").strip()
+SHEETS_SECRET = os.environ.get("SHEETS_SECRET", "").strip()
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -420,6 +427,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(DONE_CLIENT)
         await _send_ai_analysis(update, context)
         _store_anketa(update, context)
+        await _save_to_sheets(update, context)
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -529,6 +537,32 @@ async def _send_ai_analysis(update, context):
             except Exception as e:
                 log.warning("Не вдалося надіслати AI-аналіз адміну %s: %s", aid, e)
     log.info("AI-аналіз надіслано адмінам (%d част.)", len(chunks))
+
+
+async def _save_to_sheets(update, context):
+    """Надсилає анкету рядком у Google Sheets (через Apps Script). Тихо пропускає, якщо не налаштовано."""
+    if not SHEETS_URL:
+        return
+    answers = context.user_data.get("answers", {})
+    user = update.effective_user
+    headers = ["Дата"] + [q["label"] for q in QUESTIONS] + ["Джерело", "Username", "Telegram ID"]
+    row = ([time.strftime("%Y-%m-%d %H:%M")]
+           + [str(answers.get(q["key"], "")) for q in QUESTIONS]
+           + [context.user_data.get("source", "напряму"),
+              ("@" + user.username) if user.username else "",
+              str(user.id)])
+    payload = json.dumps({"secret": SHEETS_SECRET, "headers": headers, "row": row}).encode("utf-8")
+
+    def _post():
+        req = urllib.request.Request(SHEETS_URL, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=20).read().decode()[:50]
+
+    try:
+        res = await asyncio.to_thread(_post)
+        log.info("Анкету збережено в Google Sheets: %s", res)
+    except Exception as e:
+        log.warning("Не вдалося зберегти в Google Sheets: %s", e)
 
 
 def _store_anketa(update, context):
