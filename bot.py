@@ -332,7 +332,10 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q["type"] != "photo":
         await update.message.reply_text("Дякую! Спершу дайте відповідь на поточне питання 🙂")
         return ASKING
-    context.user_data["photo_file_id"] = update.message.photo[-1].file_id
+    sizes = update.message.photo
+    context.user_data["photo_file_id"] = sizes[-1].file_id           # повне — Анні в Telegram
+    small = next((s for s in reversed(sizes) if (s.width or 0) <= 800), sizes[0])
+    context.user_data["photo_sheet_id"] = small.file_id              # зменшене — для таблиці
     _record(context, "📷 Фото надіслано")
     await update.message.reply_text("Дякую за фото! 📷✨")
     return await _advance(context, update.effective_chat.id)
@@ -554,7 +557,7 @@ async def _save_to_sheets(update, context):
               str(user.id)])
     data = {"secret": SHEETS_SECRET, "headers": headers, "row": row}
     # фото обличчя — вбудувати прямо в комірку таблиці
-    photo_id = context.user_data.get("photo_file_id")
+    photo_id = context.user_data.get("photo_sheet_id") or context.user_data.get("photo_file_id")
     if photo_id:
         try:
             f = await context.bot.get_file(photo_id)
