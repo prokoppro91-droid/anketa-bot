@@ -549,14 +549,15 @@ async def _save_to_sheets(update, context):
         return
     answers = context.user_data.get("answers", {})
     user = update.effective_user
-    headers = ["Дата"] + [q["label"] for q in QUESTIONS] + ["Джерело", "Username", "Telegram ID"]
+    headers = (["Дата"] + [q["label"] for q in QUESTIONS]
+               + ["Джерело", "Username", "Telegram ID", "🔍 Велике фото"])
     row = ([time.strftime("%Y-%m-%d %H:%M")]
            + [str(answers.get(q["key"], "")) for q in QUESTIONS]
            + [context.user_data.get("source", "напряму"),
               ("@" + user.username) if user.username else "",
-              str(user.id)])
+              str(user.id), ""])
     data = {"secret": SHEETS_SECRET, "headers": headers, "row": row}
-    # фото обличчя — вбудувати прямо в комірку таблиці
+    # фото обличчя — мініатюра в комірці + посилання «відкрити на весь екран»
     photo_id = context.user_data.get("photo_sheet_id") or context.user_data.get("photo_file_id")
     if photo_id:
         try:
@@ -564,6 +565,7 @@ async def _save_to_sheets(update, context):
             img = bytes(await f.download_as_bytearray())
             data["photo"] = base64.standard_b64encode(img).decode("ascii")
             data["photoCol"] = headers.index("Фото обличчя")
+            data["linkCol"] = headers.index("🔍 Велике фото")
         except Exception as e:
             log.warning("Sheets: фото не додано: %s", e)
     payload = json.dumps(data).encode("utf-8")
