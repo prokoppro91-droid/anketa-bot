@@ -26,6 +26,7 @@ import sys
 import json
 import time
 import html
+import base64
 import asyncio
 import logging
 import urllib.request
@@ -551,12 +552,23 @@ async def _save_to_sheets(update, context):
            + [context.user_data.get("source", "напряму"),
               ("@" + user.username) if user.username else "",
               str(user.id)])
-    payload = json.dumps({"secret": SHEETS_SECRET, "headers": headers, "row": row}).encode("utf-8")
+    data = {"secret": SHEETS_SECRET, "headers": headers, "row": row}
+    # фото обличчя — вбудувати прямо в комірку таблиці
+    photo_id = context.user_data.get("photo_file_id")
+    if photo_id:
+        try:
+            f = await context.bot.get_file(photo_id)
+            img = bytes(await f.download_as_bytearray())
+            data["photo"] = base64.standard_b64encode(img).decode("ascii")
+            data["photoCol"] = headers.index("Фото обличчя")
+        except Exception as e:
+            log.warning("Sheets: фото не додано: %s", e)
+    payload = json.dumps(data).encode("utf-8")
 
     def _post():
         req = urllib.request.Request(SHEETS_URL, data=payload,
                                      headers={"Content-Type": "application/json"})
-        return urllib.request.urlopen(req, timeout=20).read().decode()[:50]
+        return urllib.request.urlopen(req, timeout=45).read().decode()[:50]
 
     try:
         res = await asyncio.to_thread(_post)
